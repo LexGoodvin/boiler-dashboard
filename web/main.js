@@ -6,17 +6,133 @@ const SENSOR_KEYS = [
     "floor_return"
 ];
 
-// Локальный кэш и таймеры на случай работы напрямую от файла без ESP32
 const sensorState = {};
 SENSOR_KEYS.forEach((key) => {
     sensorState[key] = { lastValid: null, errorSince: null };
 });
+
+// Настройки звука и состояния тревоги
+let soundEnabled = localStorage.getItem("soundEnabled") !== "false";
+let audioCtx = null;
+let lastAlertSoundTime = 0;
+let currentFaviconState = null;
 
 function getTempClass(temp) {
     if (temp >= 60) return "hot";
     if (temp >= 40) return "warm";
     return "cool";
 }
+
+// 1. Динамический Favicon (встраиваемый SVG без внешних файлов)
+function updateFavicon(isError) {
+    const targetState = isError ? "err" : "ok";
+    if (currentFaviconState === targetState) return;
+    currentFaviconState = targetState;
+
+    // Удаляем старые иконки, если они были прописаны в HTML
+    document.querySelectorAll("link[rel*='icon']").forEach((el) => el.remove());
+
+    const link = document.createElement("link");
+    link.rel = "icon";
+    link.type = "image/svg+xml";
+
+    const ns = ["http:/", "www.w3.org", "2000", "svg"].join("/");
+
+    const svgOk = `<svg xmlns="${ns}" viewBox="0 0 32 32">
+        <rect width="32" height="32" rx="8" fill="#0f172a"/>
+        <circle cx="16" cy="21" r="5" fill="#ef4444"/>
+        <rect x="14" y="6" width="4" height="14" rx="2" fill="#ef4444"/>
+        <rect x="13" y="5" width="6" height="17" rx="3" fill="none" stroke="#f8fafc" stroke-width="2"/>
+    </svg>`;
+
+    const svgErr = `<svg xmlns="${ns}" viewBox="0 0 32 32">
+        <path d="M16 2 L31 29 H1 Z" fill="#facc15" stroke="#422006" stroke-width="1.5"/>
+        <rect x="14.5" y="10" width="3" height="10" rx="1" fill="#0f172a"/>
+        <circle cx="16" cy="24.5" r="2" fill="#0f172a"/>
+    </svg>`;
+
+    const svg = isError ? svgErr : svgOk;
+    link.href = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+    document.head.appendChild(link);
+}
+
+// 2. Звуковое оповещение через Web Audio API
+function initAudio() {
+    if (!audioCtx) {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (AudioContext) {
+            audioCtx = new AudioContext();
+        }
+    }
+    if (audioCtx && audioCtx.state === "suspended") {
+        audioCtx.resume();
+    }
+}
+
+function playAlertBeep() {
+    if (!soundEnabled) return;
+    initAudio();
+    if (!audioCtx || audioCtx.state !== "running") return;
+
+    const now = audioCtx.currentTime;
+    // Двойной тревожный сигнал (880 Гц -> 660 Гц)
+    [880, 660].forEach((freq, idx) => {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+
+        osc.type = "triangle";
+        osc.frequency.setValueAtTime(freq, now + idx * 0.22);
+
+        gain.gain.setValueAtTime(0.001, now + idx * 0.22);
+        gain.gain.exponentialRampToValueAtTime(0.25, now + idx * 0.22 + 0.03);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + idx * 0.22 + 0.2);
+
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+
+        osc.start(now + idx * 0.22);
+        osc.stop(now + idx * 0.22 + 0.21);
+    });
+}
+
+// 3. Кнопка управления звуком в шапке дашборда
+function setupHeaderControls() {
+    const header = document.querySelector("header");
+    const statusEl = document.getElementById("status");
+    if (!header || !statusEl || document.getElementById("sound-toggle-btn")) return;
+
+    const controlsWrapper = document.createElement("div");
+    controlsWrapper.className = "header-controls";
+
+    const btn = document.createElement("button");
+    btn.id = "sound-toggle-btn";
+    btn.type = "button";
+    btn.className = `sound-btn ${soundEnabled ? "active" : ""}`;
+    btn.title = "Включить или отключить звуковое оповещение при аварии";
+
+    const updateBtnText = () => {
+        btn.textContent = soundEnabled ? "🔊 Звук" : "🔇 Без звука";
+        btn.classList.toggle("active", soundEnabled);
+    };
+    updateBtnText();
+
+    btn.addEventListener("click", () => {
+        soundEnabled = !soundEnabled;
+        localStorage.setItem("soundEnabled", soundEnabled);
+        updateBtnText();
+        if (soundEnabled) {
+            initAudio();
+            playAlertBeep(); // Короткий проверочный сигнал при включении
+        }
+    });
+
+    header.insertBefore(controlsWrapper, statusEl);
+    controlsWrapper.appendChild(btn);
+    controlsWrapper.appendChild(statusEl);
+}
+
+// Разблокируем аудио при первом клике в любом месте страницы
+document.addEventListener("click", initAudio, { once: true });
 
 function ensureGlobalWarningOverlay() {
     let overlay = document.getElementById("global-sensor-warning");
@@ -35,6 +151,7 @@ function ensureGlobalWarningOverlay() {
 }
 
 async function fetchTemperatures() {
+    setupHeaderControls();
     const statusEl = document.getElementById("status");
     const overlay = ensureGlobalWarningOverlay();
 
@@ -59,8 +176,6 @@ async function fetchTemperatures() {
                 if (!state.errorSince) {
                     state.errorSince = Date.now();
                 }
-                // Если бэкенд уже прислал -127.0 (значит минута на сервере прошла) 
-                // или прошла минута локально:
                 if (Date.now() - state.errorSince >= 60000 || state.lastValid === null) {
                     isError = true;
                     hasAnyCriticalError = true;
@@ -93,11 +208,20 @@ async function fetchTemperatures() {
             }
         });
 
-        // Показываем или скрываем большой полупрозрачный треугольник на весь экран
+        // Обновляем оверлей, favicon и звук при наличии критической ошибки
         if (hasAnyCriticalError) {
             overlay.classList.remove("hidden");
+            updateFavicon(true);
+
+            // Подаем звуковой сигнал сразу при возникновении ошибки и повторяем каждые 15 секунд
+            if (Date.now() - lastAlertSoundTime >= 15000) {
+                playAlertBeep();
+                lastAlertSoundTime = Date.now();
+            }
         } else {
             overlay.classList.add("hidden");
+            updateFavicon(false);
+            lastAlertSoundTime = 0;
         }
 
         const now = new Date().toLocaleTimeString("ru-RU");
@@ -109,5 +233,6 @@ async function fetchTemperatures() {
     }
 }
 
+updateFavicon(false);
 fetchTemperatures();
 setInterval(fetchTemperatures, 2000);
