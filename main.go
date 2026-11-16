@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strings"
@@ -19,6 +20,39 @@ type TempData struct {
 	FloorReturn   float64 `json:"floor_return"`
 }
 
+type SensorTracker struct {
+	lastValid     float64
+	hasValid      bool
+	errorSince    time.Time
+	isSensorError bool
+}
+
+func (st *SensorTracker) Update(raw float64) float64 {
+	// Проверяем на код ошибки DS18B20 (-127.0 с учетом погрешности float)
+	if math.Abs(raw-(-127.0)) < 0.01 {
+		if st.errorSince.IsZero() {
+			st.errorSince = time.Now()
+		}
+		// Если сбой длится >= 1 минуты, возвращаем -127.0 (флаг ошибки)
+		if time.Since(st.errorSince) >= time.Minute {
+			st.isSensorError = true
+			return -127.0
+		}
+		// Если минута не прошла и есть старое валидное значение — возвращаем его
+		if st.hasValid {
+			return st.lastValid
+		}
+		return -127.0
+	}
+
+	// Датчик прислал нормальные данные — сбрасываем таймер ошибки
+	st.errorSince = time.Time{}
+	st.isSensorError = false
+	st.lastValid = raw
+	st.hasValid = true
+	return raw
+}
+
 type AppConfig struct {
 	Port         string
 	ESP32URL     string
@@ -26,16 +60,39 @@ type AppConfig struct {
 }
 
 type TempStore struct {
-	mu      sync.RWMutex
-	data    TempData
-	hasData bool
+	mu       sync.RWMutex
+	data     TempData
+	hasData  bool
+	trackers map[string]*SensorTracker
 }
 
-func (s *TempStore) Set(d TempData) {
+func NewTempStore() *TempStore {
+	return &TempStore{
+		trackers: map[string]*SensorTracker{
+			"boiler_coil_in": {},
+			"dhw_out":        {},
+			"heating_return": {},
+			"heating_supply": {},
+			"floor_return":   {},
+		},
+	}
+}
+
+func (s *TempStore) Set(raw TempData) TempData {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data = d
+
+	processed := TempData{
+		BoilerCoilIn:  s.trackers["boiler_coil_in"].Update(raw.BoilerCoilIn),
+		DhwOut:        s.trackers["dhw_out"].Update(raw.DhwOut),
+		HeatingReturn: s.trackers["heating_return"].Update(raw.HeatingReturn),
+		HeatingSupply: s.trackers["heating_supply"].Update(raw.HeatingSupply),
+		FloorReturn:   s.trackers["floor_return"].Update(raw.FloorReturn),
+	}
+
+	s.data = processed
 	s.hasData = true
+	return processed
 }
 
 func (s *TempStore) Get() (TempData, bool) {
@@ -127,7 +184,6 @@ func saveTempJSON(filename string, temps TempData) {
 }
 
 func startESP32Poller(url string, interval time.Duration, store *TempStore, backupFile string) {
-	// Отключаем Keep-Alive и ставим жёсткий таймаут 3с для стабильной работы с ESP32 по Wi-Fi
 	client := &http.Client{
 		Timeout: 3 * time.Second,
 		Transport: &http.Transport{
@@ -154,17 +210,16 @@ func startESP32Poller(url string, interval time.Duration, store *TempStore, back
 			return
 		}
 
-		var temps TempData
-		if err := json.Unmarshal(body, &temps); err != nil {
+		var rawTemps TempData
+		if err := json.Unmarshal(body, &rawTemps); err != nil {
 			log.Printf("Ошибка разбора JSON от ESP32: %v", err)
 			return
 		}
 
-		store.Set(temps)
-		saveTempJSON(backupFile, temps)
+		processedTemps := store.Set(rawTemps)
+		saveTempJSON(backupFile, processedTemps)
 	}
 
-	// Первый опрос сразу при старте программы
 	fetch()
 
 	ticker := time.NewTicker(interval)
@@ -177,7 +232,6 @@ func startESP32Poller(url string, interval time.Duration, store *TempStore, back
 
 func makeTempsHandler(store *TempStore, localFile string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Если фоновый опросник уже получил данные (или загрузил кэш), отдаём из памяти
 		if temps, ok := store.Get(); ok {
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Cache-Control", "no-store")
@@ -185,7 +239,6 @@ func makeTempsHandler(store *TempStore, localFile string) http.HandlerFunc {
 			return
 		}
 
-		// Фолбэк на чтение локального temp.json (если url в conf.ini пустой)
 		data, err := os.ReadFile(localFile)
 		if err != nil {
 			http.Error(w, "Нет данных с датчиков", http.StatusServiceUnavailable)
@@ -206,7 +259,7 @@ func makeTempsHandler(store *TempStore, localFile string) http.HandlerFunc {
 
 func main() {
 	cfg := loadConfigFromINI("conf.ini")
-	store := &TempStore{}
+	store := NewTempStore()
 
 	loadOrInitTempJSON("temp.json", store)
 

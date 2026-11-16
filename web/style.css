@@ -238,3 +238,48 @@ h1 {
         stroke-dashoffset: 0;
     }
 }
+/* Ошибка датчика на схеме и в карточках */
+.sensor-badge.err rect {
+    stroke: #facc15;
+    fill: #422006;
+}
+
+.sensor-badge.err text {
+    fill: #fde047;
+}
+
+.err-inline {
+    color: #facc15;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.warn-tri {
+    color: #facc15;
+    font-size: 1.15em;
+}
+
+/* Полупрозрачный желтый треугольник на весь экран */
+.global-warning-overlay {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none; /* Чтобы не блокировать клики и выделение на странице */
+    z-index: 9999;
+    transition: opacity 0.3s ease;
+}
+
+.global-warning-overlay.hidden {
+    opacity: 0;
+    visibility: hidden;
+}
+
+.global-warning-icon {
+    width: min(75vw, 75vh);
+    height: min(75vw, 75vh);
+    fill: rgba(250, 204, 21, 0.16); /* Полупрозрачный желтый цвет */
+    filter: drop-shadow(0 0 24px rgba(250, 204, 21, 0.2));
+}
